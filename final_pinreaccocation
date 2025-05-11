@@ -1,0 +1,843 @@
+#include <AsyncTCP.h>
+
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <Arduino.h>
+#include <TM1637Display.h>
+#include <DHT.h>
+
+// WiFi Credentials
+const char* ssid = "Radha";
+const char* password = "1223334444";
+
+// TM1637 Display Pins
+#define CLK1 4
+#define DIO1 2
+#define CLK2 16
+#define DIO2 17 
+#define CLK3 21
+#define DIO3 22
+TM1637Display display1(CLK1, DIO1);
+TM1637Display display2(CLK2, DIO2);
+TM1637Display display3(CLK3, DIO3);
+
+// 74HC4051 MUX Pins
+#define MUX_SIG 32
+#define MUX_S0 25
+#define MUX_S1 26
+#define MUX_S2 27
+
+// DHT11 Temperature Sensor
+#define DHTPIN 15
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// Sensors
+#define ACS712_PIN 36  // Current Sensor
+#define VOLTAGE_PIN 39 // Voltage Sensor
+#define DOOR_SENSOR_PIN 34
+#define PIR_PIN 35
+
+// Outputs
+#define SSR1 13  // Bedroom Light
+#define SSR2 12  // Kitchen Light
+#define SSR3 14  // Middle Light
+#define SSR4 23  // Bathroom Light
+#define SSR5 33  // Toilet Light
+#define SSR6 19  // Balcony Light
+#define SSR7 18  // Hall Left Light
+#define SSR8 5   // Hall Right Light
+#define RELAY1 13  // Fan 1
+#define RELAY2 12  // Fan 2
+#define RELAY3 14 // Fan 3
+#define RELAY4 5  // Fan 4 (changed from 27 to 1)
+AsyncWebServer server(8080);
+
+// Device states (0-7 lights, 8-11 fans)
+bool deviceStates[12] = {false};
+bool switchStates[8] = {false}; // MUX switch states
+bool lastSwitchStates[8] = {false}; // Track previous switch states for edge detection
+
+// Sensor readings
+float temperature = 0.0;
+float acCurrent = 0.0;  // ACS712 current in mA
+float acVoltage = 0.0;  // Voltage sensor in V
+float wattage = 0.0;
+int displayCycle = 0;   // Cycle TM1637 displays
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>SVR IOT 1BHK - RADHA</title>
+  <style>
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background-color: #f0f0f0;
+      font-family: "Helvetica", "Arial", sans-serif;
+    }
+    .container {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 20px;
+    }
+    .floor-plan {
+      width: 600px;
+      height: 600px;
+      position: relative;
+      background-color: #fff;
+      border: 3px solid #000;
+      box-sizing: border-box;
+      border-right: none;
+    }
+    .floor-plan::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 3px;
+      height: 500px;
+      background-color: #000;
+    }
+    .room {
+      position: absolute;
+      border: 2px solid #000;
+      box-sizing: border-box;
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      font-weight: bold;
+      font-size: 16px;
+      flex-direction: column;
+    }
+    .bedroom {
+      top: 0;
+      left: 0;
+      width: 297px;
+      height: 280px;
+      border-right: none;
+      border-top: none;
+      border-left: none;
+      background-color: #D9C2E3;
+    }
+    .bedroom::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 2px;
+      height: 190px;
+      background-color: #000;
+    }
+    .bedroom-rectangle {
+      position: absolute;
+      top: 0;
+      right: 120px;
+      width: 150px;
+      height: 180px;
+      border: 2px solid #000;
+      background-color: #e0e0e0;
+      margin-left: 50px;
+    }
+    .small-rectangle {
+      position: absolute;
+      top: 0;
+      width: 60px;
+      height: 30px;
+      border: 2px solid #000;
+      background-color: #d0d0d0;
+    }
+    .small-rectangle-1 { left: 0; }
+    .small-rectangle-2 { left: 88px; }
+    .kitchen {
+      top: 0;
+      left: 297px;
+      width: 297px;
+      height: 280px;
+      border: none;
+      background-color: #FFF2CC;
+    }
+    .kitchen-rectangle {
+      position: absolute;
+      right: 0;
+      bottom: 0;
+      width: 60px;
+      height: 200px;
+      border: 2px solid #000;
+      background-color: #e0e0e0;
+    }
+    .kitchen-square,
+    .kitchen-square-bottom {
+      position: absolute;
+      width: 40px;
+      height: 40px;
+      border: 2px solid #000;
+      background-color: #d0d0d0;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    .kitchen-square { top: 20px; }
+    .kitchen-square-bottom { bottom: 0; margin-bottom: 10px; }
+    .bathroom {
+      top: 280px;
+      left: 0;
+      width: 200px;
+      height: 120px;
+      border: none;
+      position: relative;
+      background-color: #D5E8D4;
+    }
+    .bathroom::after {
+      content: "";
+      position: absolute;
+      bottom: 0;
+      right: 0;
+      width: 2px;
+      height: 60px;
+      background-color: #000;
+    }
+    .middle {
+      top: 160px;
+      left: 200px;
+      width: 110px;
+      height: 120px;
+      position: relative;
+      border: none;
+      background-color: #fff;
+    }
+    .middle::before {
+      content: "";
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 90%;
+      height: 1px;
+      background-color: #000;
+    }
+    .toilet {
+      top: 280px;
+      left: 395px;
+      width: 200px;
+      height: 120px;
+      position: absolute;
+      background-color: #D5E8D4;
+      border-left: none;
+      border-right: none;
+    }
+    .toilet::before {
+      content: "";
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 2px;
+      height: 70px;
+      background-color: #000;
+    }
+    .balcony {
+      top: 400px;
+      left: 0;
+      width: 100px;
+      height: 198px;
+      border: none;
+      background-color: #4caf50;
+    }
+    .balcony::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 2px;
+      height: 65px;
+      background-color: #000;
+    }
+    .balcony::before {
+      content: "";
+      position: absolute;
+      right: 0;
+      width: 2px;
+      height: 60px;
+      background-color: #000;
+      bottom: 0;
+    }
+    .hall {
+      top: 400px;
+      left: 100px;
+      width: 494px;
+      height: 198px;
+      position: absolute;
+      background-color: #E6D0DE;
+      border: none;
+    }
+    .hall::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 2px;
+      height: 65px;
+      background-color: #000;
+    }
+    .hall::after {
+      content: "";
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 2px;
+      height: 60px;
+      background-color: #000;
+    }
+    .hall-rectangle {
+      position: absolute;
+      left: 100px;
+      bottom: 0;
+      width: 250px;
+      height: 50px;
+      border: 2px solid #000;
+      background-color: #fff;
+    }
+    .hall-square {
+      position: absolute;
+      width: 70px;
+      height: 40px;
+      border: 2px solid #000;
+      background-color: #e0e0e0;
+      margin-bottom: 20px;
+      margin-left: 4px;
+    }
+    .hall-square-1 { bottom: 0; left: 0; }
+    .hall-square-2 { bottom: 0; left: 85px; }
+    .hall-square-3 { bottom: 0; left: 170px; }
+    .center-divider {
+      position: absolute;
+      top: 0;
+      left: 297px;
+      width: 2px;
+      height: 0;
+      background-color: #000;
+    }
+    .bathroom-top-divider {
+      position: absolute;
+      bottom: 195px;
+      left: 0;
+      width: 200px;
+      height: 2px;
+      background-color: #000;
+    }
+    .kitchen-toilet-divider {
+      position: absolute;
+      top: 280px;
+      left: 445px;
+      width: 149px;
+      height: 2px;
+      background-color: #000;
+    }
+    .dot {
+      width: 20px;
+      height: 20px;
+      background-color: #888;
+      border-radius: 50%;
+      position: absolute;
+      border: 2px solid #666;
+    }
+    .dot.on {
+      background-color: #ffcc00;
+    }
+    .bedroom .dot-light { top: 110px; left: 190px; }
+    .bedroom .dot-fan4 { top: 150px; left: 190px; } /* Fan 4 in Bedroom */
+    .kitchen .dot-light { top: 100px; right: 140px; }
+    .kitchen .dot-fan3 { top: 140px; right: 140px; } /* Fan 3 in Kitchen */
+    .bathroom .dot { top: 30px; left: 90px; }
+    .middle .dot { top: 30px; left: 70%; }
+    .toilet .dot { top: 20px; right: 100px; }
+    .balcony .dot { top: 65px; left: 30px; }
+    .hall .dot-bottom-left { left: 150px; top: 55px; }
+    .hall .dot-bottom-right { top: 56px; right: 150px; }
+    .hall .dot-fan1 { left: 200px; top: 55px; } /* Fan 1 in Hall */
+    .hall .dot-fan2 { left: 250px; top: 55px; } /* Fan 2 in Hall */
+    .control-panel {
+      width: 280px;
+      padding: 20px;
+      background-color: #ffffff;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      text-align: center;
+      border: 1px solid #e0e0e0;
+      overflow: hidden;
+    }
+    .control-panel h1 {
+      color: #333;
+      font-size: 26px;
+      margin: 0 0 10px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+    .control-panel h3 {
+      color: #666;
+      font-size: 16px;
+      margin: 0 0 20px;
+      font-weight: 400;
+    }
+    .control-panel p {
+      font-size: 14px;
+      color: #777;
+      margin: 0 0 8px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .button-container {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .button {
+      width: 80px;
+      height: 40px;
+      border: none;
+      color: white;
+      background-color: #4caf50;
+      padding: 8px 0;
+      text-decoration: none;
+      font-size: 16px;
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background-color 0.3s ease, transform 0.1s ease;
+      font-weight: 600;
+      text-align: center;
+      line-height: 24px;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+    .button:hover { transform: translateY(-2px); }
+    .button-on { background-color: #4caf50; }
+    .button-on:active { background-color: #45a049; transform: translateY(0); }
+    .button-off { background-color: #f44336; }
+    .button-off:active { background-color: #da190b; transform: translateY(0); }
+    .measurement-box {
+      width: 280px;
+      padding: 20px;
+      background-color: #ffffff;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      text-align: center;
+      border: 1px solid #e0e0e0;
+    }
+    .measurement-box h2 {
+      color: #333;
+      font-size: 22px;
+      margin: 0 0 15px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+    .measurements {
+      margin: 0;
+      padding: 10px;
+      background-color: #f9f9f9;
+      border-radius: 6px;
+      border: 1px solid #e0e0e0;
+    }
+    .measurements span {
+      font-size: 14px;
+      color: #333;
+      font-weight: 500;
+      display: block;
+      margin: 4px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="floor-plan">
+      <div class="room bedroom">
+        Bedroom
+        <div class="dot dot-light" id="bedroom-dot"></div>
+        <div class="dot dot-fan4" id="fan4-dot"></div> <!-- Fan 4 -->
+        <div class="bedroom-rectangle">
+          <div class="small-rectangle small-rectangle-1"></div>
+          <div class="small-rectangle small-rectangle-2"></div>
+        </div>
+      </div>
+      <div class="room kitchen">
+        Kitchen
+        <div class="dot dot-light" id="kitchen-dot"></div>
+        <div class="dot dot-fan3" id="fan3-dot"></div> <!-- Fan 3 -->
+        <div class="kitchen-rectangle">
+          <div class="kitchen-square"></div>
+          <div class="kitchen-square-bottom"></div>
+        </div>
+      </div>
+      <div class="room bathroom">
+        Bathroom
+        <div class="dot" id="bathroom-dot"></div>
+      </div>
+      <div class="room middle">
+        Middle
+        <div class="dot" id="middle-dot"></div>
+      </div>
+      <div class="room toilet">
+        Toilet
+        <div class="dot" id="toilet-dot"></div>
+      </div>
+      <div class="room balcony">
+        Balcony
+        <div class="dot" id="balcony-dot"></div>
+      </div>
+      <div class="room hall">
+        Hall
+        <div class="dot dot-bottom-left" id="Hall-left-dot"></div>
+        <div class="dot dot-bottom-right" id="Hall-right-dot"></div>
+        <div class="dot dot-fan1" id="fan1-dot"></div> <!-- Fan 1 -->
+        <div class="dot dot-fan2" id="fan2-dot"></div> <!-- Fan 2 -->
+        <div class="hall-rectangle">
+          <div class="hall-square hall-square-1"></div>
+          <div class="hall-square hall-square-2"></div>
+          <div class="hall-square hall-square-3"></div>
+        </div>
+      </div>
+      <div class="center-divider"></div>
+      <div class="bathroom-top-divider"></div>
+      <div class="kitchen-toilet-divider"></div>
+    </div>
+    <div class="control-panel">
+      <h1>1BHK Control Panel</h1>
+      <h3>By-SVR Robotics Pvt. Ltd.</h3>
+      <p id="bedroom-status">Bedroom Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="bedroom-on">ON</a>
+        <a class="button button-off" id="bedroom-off">OFF</a>
+      </div>
+      <p id="kitchen-status">Kitchen Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="kitchen-on">ON</a>
+        <a class="button button-off" id="kitchen-off">OFF</a>
+      </div>
+      <p id="middle-status">Middle Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="middle-on">ON</a>
+        <a class="button button-off" id="middle-off">OFF</a>
+      </div>
+      <p id="bathroom-status">Bathroom Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="bathroom-on">ON</a>
+        <a class="button button-off" id="bathroom-off">OFF</a>
+      </div>
+      <p id="toilet-status">Toilet Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="toilet-on">ON</a>
+        <a class="button button-off" id="toilet-off">OFF</a>
+      </div>
+      <p id="balcony-status">Balcony Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="balcony-on">ON</a>
+        <a class="button button-off" id="balcony-off">OFF</a>
+      </div>
+      <p id="Hall-left-status">Hall Left Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="Hall-left-on">ON</a>
+        <a class="button button-off" id="Hall-left-off">OFF</a>
+      </div>
+      <p id="Hall-right-status">Hall Right Light: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="Hall-right-on">ON</a>
+        <a class="button button-off" id="Hall-right-off">OFF</a>
+      </div>
+      <p id="fan1-status">Fan 1: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="fan1-on">ON</a>
+        <a class="button button-off" id="fan1-off">OFF</a>
+      </div>
+      <p id="fan2-status">Fan 2: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="fan2-on">ON</a>
+        <a class="button button-off" id="fan2-off">OFF</a>
+      </div>
+      <p id="fan3-status">Fan 3: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="fan3-on">ON</a>
+        <a class="button button-off" id="fan3-off">OFF</a>
+      </div>
+      <p id="fan4-status">Fan 4: OFF</p>
+      <div class="button-container">
+        <a class="button button-on" id="fan4-on">ON</a>
+        <a class="button button-off" id="fan4-off">OFF</a>
+      </div>
+    </div>
+    <div class="measurement-box">
+      <h2>Measurements</h2>
+      <div class="measurements">
+        <span id="Voltage">Real time Voltage: 0V</span><br>
+        <span id="Current">Real time Current: 0mA</span><br>
+        <span id="wattage">Wattage: 0W</span>
+      </div>
+    </div>
+  </div>
+  <script>
+    const devices = [
+      { onBtn: "bedroom-on", offBtn: "bedroom-off", status: "bedroom-status", dot: "bedroom-dot" },
+      { onBtn: "kitchen-on", offBtn: "kitchen-off", status: "kitchen-status", dot: "kitchen-dot" },
+      { onBtn: "middle-on", offBtn: "middle-off", status: "middle-status", dot: "middle-dot" },
+      { onBtn: "bathroom-on", offBtn: "bathroom-off", status: "bathroom-status", dot: "bathroom-dot" },
+      { onBtn: "toilet-on", offBtn: "toilet-off", status: "toilet-status", dot: "toilet-dot" },
+      { onBtn: "balcony-on", offBtn: "balcony-off", status: "balcony-status", dot: "balcony-dot" },
+      { onBtn: "Hall-left-on", offBtn: "Hall-left-off", status: "Hall-left-status", dot: "Hall-left-dot" },
+      { onBtn: "Hall-right-on", offBtn: "Hall-right-off", status: "Hall-right-status", dot: "Hall-right-dot" },
+      { onBtn: "fan1-on", offBtn: "fan1-off", status: "fan1-status", dot: "fan1-dot" },
+      { onBtn: "fan2-on", offBtn: "fan2-off", status: "fan2-status", dot: "fan2-dot" },
+      { onBtn: "fan3-on", offBtn: "fan3-off", status: "fan3-status", dot: "fan3-dot" },
+      { onBtn: "fan4-on", offBtn: "fan4-off", status: "fan4-status", dot: "fan4-dot" }
+    ];
+
+    function setupLightControl(onBtnId, offBtnId) {
+      const onBtn = document.getElementById(onBtnId);
+      const offBtn = document.getElementById(offBtnId);
+      onBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        fetch("/command?cmd=" + onBtnId);
+      });
+      offBtn.addEventListener("click", function (e) {
+        e.preventDefault();
+        fetch("/command?cmd=" + offBtnId);
+      });
+    }
+
+    devices.forEach(device => {
+      setupLightControl(device.onBtn, device.offBtn);
+    });
+
+    function updateStates() {
+      fetch("/states")
+        .then(response => response.json())
+        .then(data => {
+          const states = data.states;
+          const voltage = data.voltage;
+          const current = data.current;
+          const wattage = data.wattage;
+          devices.forEach((device, index) => {
+            const status = document.getElementById(device.status);
+            const dot = device.dot ? document.getElementById(device.dot) : null;
+            const isOn = states[index];
+            status.textContent = `${device.status.replace('-status', '')}: ${isOn ? 'ON' : 'OFF'}`;
+            if (dot) {
+              if (isOn) dot.classList.add("on");
+              else dot.classList.remove("on");
+            }
+          });
+          document.getElementById("Voltage").textContent = `Real time Voltage: ${voltage}V`;
+          document.getElementById("Current").textContent = `Real time Current: ${current}mA`;
+          document.getElementById("wattage").textContent = `Wattage: ${wattage}W`;
+        });
+    }
+
+    setInterval(updateStates, 500);
+    updateStates();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting...");
+  }
+  
+  Serial.println("Connected to WiFi");
+  Serial.println(WiFi.localIP());
+
+  dht.begin();
+  display1.setBrightness(7);
+  display2.setBrightness(7);
+  display3.setBrightness(7);
+
+  pinMode(DOOR_SENSOR_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(ACS712_PIN, INPUT);
+  pinMode(VOLTAGE_PIN, INPUT);
+
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_SIG, INPUT);
+  
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+  pinMode(RELAY3, OUTPUT);
+  pinMode(RELAY4, OUTPUT);
+  
+  pinMode(SSR1, OUTPUT);
+  pinMode(SSR2, OUTPUT);
+  pinMode(SSR3, OUTPUT);
+  pinMode(SSR4, OUTPUT);
+  pinMode(SSR5, OUTPUT);
+  pinMode(SSR6, OUTPUT);
+  pinMode(SSR7, OUTPUT);
+  pinMode(SSR8, OUTPUT);
+
+  // Initialize outputs based on deviceStates
+  for (int i = 0; i < 12; i++) {
+    if (i < 8) {
+      digitalWrite(i == 0 ? SSR1 : i == 1 ? SSR2 : i == 2 ? SSR3 : i == 3 ? SSR4 : 
+                    i == 4 ? SSR5 : i == 5 ? SSR6 : i == 6 ? SSR7 : SSR8, deviceStates[i]);
+    } else {
+      digitalWrite(i == 8 ? RELAY1 : i == 9 ? RELAY2 : i == 10 ? RELAY3 : RELAY4, deviceStates[i]);
+    }
+  }
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  server.on("/command", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("cmd")) {
+      String command = request->getParam("cmd")->value();
+      Serial.println("Received command: " + command);
+      updateDeviceState(command);
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/states", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "{";
+    json += "\"states\":[";
+    for (int i = 0; i < 12; i++) {
+      json += deviceStates[i] ? "true" : "false";
+      if (i < 11) json += ",";
+    }
+    json += "],";
+    json += "\"voltage\":" + String(acVoltage, 1) + ",";
+    json += "\"current\":" + String(acCurrent, 1) + ",";
+    json += "\"wattage\":" + String(wattage, 1);
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  server.begin();
+}
+
+void updateDeviceState(String command) {
+  if (command == "bedroom-on") { deviceStates[0] = true; digitalWrite(SSR1, HIGH); }
+  else if (command == "bedroom-off") { deviceStates[0] = false; digitalWrite(SSR1, LOW); }
+  else if (command == "kitchen-on") { deviceStates[1] = true; digitalWrite(SSR2, HIGH); }
+  else if (command == "kitchen-off") { deviceStates[1] = false; digitalWrite(SSR2, LOW); }
+  else if (command == "middle-on") { deviceStates[2] = true; digitalWrite(SSR3, HIGH); }
+  else if (command == "middle-off") { deviceStates[2] = false; digitalWrite(SSR3, LOW); }
+  else if (command == "bathroom-on") { deviceStates[3] = true; digitalWrite(SSR4, HIGH); }
+  else if (command == "bathroom-off") { deviceStates[3] = false; digitalWrite(SSR4, LOW); }
+  else if (command == "toilet-on") { deviceStates[4] = true; digitalWrite(SSR5, HIGH); }
+  else if (command == "toilet-off") { deviceStates[4] = false; digitalWrite(SSR5, LOW); }
+  else if (command == "balcony-on") { deviceStates[5] = true; digitalWrite(SSR6, HIGH); }
+  else if (command == "balcony-off") { deviceStates[5] = false; digitalWrite(SSR6, LOW); }
+  else if (command == "Hall-left-on") { deviceStates[6] = true; digitalWrite(SSR7, HIGH); }
+  else if (command == "Hall-left-off") { deviceStates[6] = false; digitalWrite(SSR7, LOW); }
+  else if (command == "Hall-right-on") { deviceStates[7] = true; digitalWrite(SSR8, HIGH); }
+  else if (command == "Hall-right-off") { deviceStates[7] = false; digitalWrite(SSR8, LOW); }
+  else if (command == "fan1-on") { deviceStates[8] = true; digitalWrite(RELAY1, HIGH); }
+  else if (command == "fan1-off") { deviceStates[8] = false; digitalWrite(RELAY1, LOW); }
+  else if (command == "fan2-on") { deviceStates[9] = true; digitalWrite(RELAY2, HIGH); }
+  else if (command == "fan2-off") { deviceStates[9] = false; digitalWrite(RELAY2, LOW); }
+  else if (command == "fan3-on") { deviceStates[10] = true; digitalWrite(RELAY3, HIGH); }
+  else if (command == "fan3-off") { deviceStates[10] = false; digitalWrite(RELAY3, LOW); }
+  else if (command == "fan4-on") { deviceStates[11] = true; digitalWrite(RELAY4, HIGH); }
+  else if (command == "fan4-off") { deviceStates[11] = false; digitalWrite(RELAY4, LOW); }
+}
+
+void readMuxSwitches() {
+  for (int i = 0; i < 8; i++) {
+    digitalWrite(MUX_S0, i & 0x01);
+    digitalWrite(MUX_S1, i & 0x02);
+    digitalWrite(MUX_S2, i & 0x04);
+    delay(1); // Small delay for MUX settling
+    switchStates[i] = digitalRead(MUX_SIG);
+    if (switchStates[i] != lastSwitchStates[i]) { // Detect change
+      deviceStates[i] = switchStates[i];
+      digitalWrite(i == 0 ? SSR1 : i == 1 ? SSR2 : i == 2 ? SSR3 : i == 3 ? SSR4 : 
+                    i == 4 ? SSR5 : i == 5 ? SSR6 : i == 6 ? SSR7 : SSR8, deviceStates[i]);
+      Serial.print("Switch ");
+      Serial.print(i + 1);
+      Serial.println(deviceStates[i] ? " ON" : " OFF");
+      lastSwitchStates[i] = switchStates[i];
+    }
+  }
+}
+
+void loop() {
+  // Read DHT11 Temperature
+  float temp = dht.readTemperature();
+  if (!isnan(temp)) {
+    temperature = temp;
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" C");
+  }
+
+  // Read ACS712 Current Sensor (AC Supply)
+  int acsRaw = analogRead(ACS712_PIN);
+  float acsVoltage = acsRaw * (3.3 / 4095.0); // ADC voltage
+  acCurrent = ((acsVoltage - 1.65) / 0.066) * 1000; // 20A version: 66mV/A, midpoint 1.65V, to mA
+  if (acCurrent < 0) acCurrent = 0; // Clamp negative values
+  Serial.print("AC Current: ");
+  Serial.print(acCurrent);
+  Serial.println(" mA");
+
+  // Read Voltage Sensor
+  int voltRaw = analogRead(VOLTAGE_PIN);
+  acVoltage = voltRaw * (3.3 / 4095.0) * (230 / 3.3); // Assuming voltage divider scales 230V to 3.3V
+  Serial.print("AC Voltage: ");
+  Serial.print(acVoltage);
+  Serial.println(" V");
+
+  // Calculate Wattage
+  wattage = (acVoltage * (acCurrent / 1000.0)); // Convert mA to A
+  Serial.print("Wattage: ");
+  Serial.print(wattage);
+  Serial.println(" W");
+
+  // Display on TM1637 (Cycle every second)
+  displayCycle = (displayCycle + 1) % 3;
+  if (displayCycle == 0) display1.showNumberDec((int)acVoltage);
+  else if (displayCycle == 1) display2.showNumberDec((int)acCurrent);
+  else display3.showNumberDec((int)wattage);
+
+  // Read Door Sensor
+  bool doorOpen = digitalRead(DOOR_SENSOR_PIN);
+  Serial.print("Door Sensor: ");
+  Serial.println(doorOpen ? "Open" : "Closed");
+
+  // Read PIR Motion Sensor
+  bool motionDetected = digitalRead(PIR_PIN);
+  Serial.print("PIR Motion: ");
+  Serial.println(motionDetected ? "Detected" : "No Motion");
+
+  // Read MUX Switches (Controls lights 0-7)
+  readMuxSwitches();
+
+  // Serial Input Control
+  if (Serial.available() > 0) {
+    int input = Serial.parseInt();
+    if (input >= 1 && input <= 12) {
+      int index = input - 1;
+      deviceStates[index] = !deviceStates[index];
+      Serial.print("Toggled device ");
+      Serial.print(input);
+      Serial.println(deviceStates[index] ? " ON" : " OFF");
+      if (index < 8) { // Lights
+        digitalWrite(index == 0 ? SSR1 : index == 1 ? SSR2 : index == 2 ? SSR3 : index == 3 ? SSR4 : 
+                      index == 4 ? SSR5 : index == 5 ? SSR6 : index == 6 ? SSR7 : SSR8, deviceStates[index]);
+      } else { // Fans
+        digitalWrite(index == 8 ? RELAY1 : index == 9 ? RELAY2 : index == 10 ? RELAY3 : RELAY4, deviceStates[index]);
+      }
+      while (Serial.available() > 0) Serial.read();
+    }
+  }
+
+  delay(100); // Reduced delay for responsiveness
+}
